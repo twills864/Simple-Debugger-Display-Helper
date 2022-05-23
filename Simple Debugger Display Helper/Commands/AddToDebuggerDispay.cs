@@ -3,9 +3,11 @@ using EnvDTE;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.PlatformUI;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Text;
+using Microsoft.VisualStudio.TextManager.Interop;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -24,14 +26,18 @@ namespace Simple_Debugger_Display_Helper
 
         public static async Task AddToDebuggerDisplayAsync()
         {
+            ScrollInfo initialScroll = await ScrollInfo.NewScrollInfoAsync();
+
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
             DTE service = Microsoft.VisualStudio.Shell.Package.GetGlobalService(typeof(DTE)) as DTE;
 
-            //bool wentToDefinition = await GoToDefinitionAsync(service);
             await GoToDefinitionAsync(service);
-            await AddOrAppendToDebuggerDisplayAsync(service);
-        }
+            int? scrollToLine = await AddOrAppendToDebuggerDisplayAsync(service);
 
+            ScrollInfo endScroll = await ScrollInfo.NewScrollInfoAsync();
+
+            RestoreScrollIfNecessary(initialScroll, endScroll, scrollToLine);
+        }
 
         /*
          * 1. Get the global IVsObjectManager2 interface (implemented by the SVsObjectManager object)
@@ -53,7 +59,7 @@ namespace Simple_Debugger_Display_Helper
 
         #region Add or Append
 
-        private static async Task AddOrAppendToDebuggerDisplayAsync(DTE service)
+        private static async Task<int?> AddOrAppendToDebuggerDisplayAsync(DTE service)
         {
             DocumentView docView = await VS.Documents.GetActiveDocumentViewAsync();
             ITextBuffer textBuffer = docView.TextBuffer;
@@ -67,27 +73,45 @@ namespace Simple_Debugger_Display_Helper
             SyntaxToken caretToken = GetTokenUnderCaret(root, ref caretPosition);
 
             if (!IsValidToken(caretToken))
-                return;
+                return null;
 
             ClassDeclarationSyntax containingClassDeclaration = GetContainingClassDeclaration(caretToken);
             if (containingClassDeclaration == null)
-                return;
+                return null;
+
+            int? classLine = containingClassDeclaration.GetLocation().GetLineSpan().StartLinePosition.Line;
 
             ITrackingPoint classTrackingPoint = snapshot.CreateTrackingPoint(containingClassDeclaration.SpanStart, PointTrackingMode.Positive);
+
             ITextEdit edit = textBuffer.CreateEdit();
+            try
+            {
+                if (!HasDebuggerDisplayAttribute(containingClassDeclaration))
+                    AddDebuggerDisplay(edit, allText, containingClassDeclaration, caretToken);
+                else
+                    AppendToDebuggerDisplay(edit, allText, containingClassDeclaration, caretToken);
 
-            if (!HasDebuggerDisplayAttribute(containingClassDeclaration))
-                AddDebuggerDisplay(edit, allText, containingClassDeclaration, caretToken);
-            else
-                AppendToDebuggerDisplay(edit, allText, containingClassDeclaration, caretToken);
+                AddDiagnosticsToUsings(edit, root);
 
-            AddDiagnosticsToUsings(edit, root);
+                edit.Apply();
 
-            // TODO Maybe: Check for DebuggerDisplay private method and add it if it's not present
+                await SetCaretToDebuggerDisplayAsync(textBuffer, classTrackingPoint, service);
 
-            edit.Apply();
+                // TODO Maybe: Check for DebuggerDisplay private method and add it if it's not present
+            } catch (Exception ex)
+            {
+                classLine = null;
+                try
+                {
+                    edit.Cancel();
+                }
+                catch (InvalidOperationException)
+                {
 
-            await SetCaretToDebuggerDisplayAsync(textBuffer, classTrackingPoint, service);
+                }
+            }
+
+            return classLine;
         }
 
         #region Roslyn functionality
@@ -181,65 +205,49 @@ namespace Simple_Debugger_Display_Helper
 
         #region Append to Debugger Display
 
-        /// <summary>
-        /// TODO: Handle case where DebuggerDisplay() had empty parameters, which would cause
-        /// a syntactically-incorrect plus sign to be added.
-        /// </summary>
         private static void AppendToDebuggerDisplay(ITextEdit edit, string allText, ClassDeclarationSyntax classDeclaration, SyntaxToken caretToken)
         {
-            const string DebuggerDisplayInvoke = "DebuggerDisplay(";
+            string leftQuotationMark;
+            string rightQuotationMark;
+            int insertPosition;
 
-            string leftPlusSign = "";
-            string leftQuotationMark = "";
-            string rightQuotationMark = "";
-            string rightParenthesis = "";
-            string leftSpace = " ";
+            bool AttributeSyntaxNameIdentifierTextEquals(AttributeSyntax syntax, string value)
+                => ((IdentifierNameSyntax)syntax.Name).Identifier.Text == value;
 
-            AttributeListSyntax debuggerDisplayList = classDeclaration.AttributeLists
-                .Where(x => x.ToString().Contains(DebuggerDisplayInvoke))
+            AttributeSyntax attribute = classDeclaration.AttributeLists
+                .SelectMany(list => list.Attributes
+                    .Where(attribute => AttributeSyntaxNameIdentifierTextEquals(attribute, "DebuggerDisplay")))
                 .First();
-
-            // No quotation marks - track last parenthesis instead, and add quotation marks later
-            if (!TryGetLastIndexOf(allText, debuggerDisplayList, '"', out int lastQuotationMark))
+            AttributeArgumentListSyntax argumentList = attribute.ArgumentList;
+            AttributeArgumentSyntax lastArgument = argumentList.Arguments.LastOrDefault();
+            
+            // No arguments at all - insert before closing right parenthesis
+            if(lastArgument == null)
             {
+                insertPosition = argumentList.Span.End - 1;
                 leftQuotationMark = "\"";
                 rightQuotationMark = "\"";
-
-                if (!TryGetLastIndexOf(allText, debuggerDisplayList, ')', out lastQuotationMark))
-                {
-                    rightParenthesis = ")";
-                    lastQuotationMark = debuggerDisplayList.Span.End - 1;
-                }
-
-                if (!DebuggerDisplayIsParameterless(debuggerDisplayList))
-                    leftPlusSign = " + ";
-                else
-                    leftSpace = "";
             }
-            else if (allText[lastQuotationMark - 1] == '"')
-                leftSpace = "";
+            
+            // Last argument is a string literal - insert into existing string
+            else if(lastArgument.Expression is LiteralExpressionSyntax)
+            {
+                insertPosition = lastArgument.Span.End - 1;
+                leftQuotationMark = " ";
+                rightQuotationMark = "";
+            }
+
+            // Last argument is not a string literal - likely a const string, use add operator
+            else
+            {
+                insertPosition = lastArgument.Span.End;
+                leftQuotationMark = " + \"";
+                rightQuotationMark = "\"";
+            }
 
             string tokenText = GetTokenText(caretToken);
-            string insert = $"{leftSpace}{leftPlusSign}{leftQuotationMark}{{{tokenText}}}{rightQuotationMark}{rightParenthesis}";
-            edit.Insert(lastQuotationMark, insert);
-        }
-
-        private static bool TryGetLastIndexOf(string allText, CSharpSyntaxNode node, char c, out int lastIndex)
-        {
-            lastIndex = allText.LastIndexOf(c, node.Span.End);
-
-            if (lastIndex == -1 || lastIndex < node.SpanStart)
-                return false;
-            return true;
-        }
-
-        private static bool DebuggerDisplayIsParameterless(AttributeListSyntax debuggerDisplayList)
-        {
-            const string DebuggerDisplayText = "DebuggerDisplay";
-
-            AttributeSyntax debuggerDisplay = debuggerDisplayList.Attributes.Where(x => x.Name.ToString().Contains(DebuggerDisplayText)).First();
-            bool isParameterless = !debuggerDisplay.ArgumentList.Arguments.Any();
-            return isParameterless;
+            string insert = $"{leftQuotationMark}{{{tokenText}}}{rightQuotationMark}";
+            edit.Insert(insertPosition, insert);
         }
 
         #endregion
@@ -305,5 +313,15 @@ namespace Simple_Debugger_Display_Helper
         }
 
         #endregion
+
+        private static void RestoreScrollIfNecessary(ScrollInfo initialScroll, ScrollInfo endScroll, int? scrollToLine)
+        {
+            if (initialScroll.InitialFilePath != endScroll.InitialFilePath
+                || !scrollToLine.HasValue
+                || !initialScroll.ContainsLine(scrollToLine.Value))
+                return;
+
+            initialScroll.RestoreScroll();
+        }
     }
 }
